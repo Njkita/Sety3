@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Local certs / generated (если у тебя где-то локально есть)
+mesh/certs/
+mesh/configs/
+
+# Logs
+*.log

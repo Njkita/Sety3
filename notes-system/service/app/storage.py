@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import List
 from datetime import datetime
 import hashlib
+import psycopg2
+from psycopg2 import errors
 
 @dataclass
 class Note:
@@ -30,15 +32,22 @@ class Storage:
         for conn in self.conns:
             conn.autocommit = True
             with conn.cursor() as cur:
-                cur.execute("""
-                CREATE TABLE IF NOT EXISTS notes (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    description TEXT NOT NULL,
-                    created_at TIMESTAMPTZ NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL
-                );
-                """)
+                cur.execute("SELECT pg_advisory_lock(777001);")
+                try:
+                    cur.execute("""
+                    CREATE TABLE IF NOT EXISTS notes (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        description TEXT NOT NULL,
+                        created_at TIMESTAMPTZ NOT NULL,
+                        updated_at TIMESTAMPTZ NOT NULL
+                    );
+                    """)
+                except (errors.UniqueViolation, errors.DuplicateTable, errors.DuplicateObject):
+                    pass
+                finally:
+                    cur.execute("SELECT pg_advisory_unlock(777001);")
+
 
     def _shard_index(self, note_id: str) -> int:
         h = hashlib.sha1(note_id.encode("utf-8")).digest()

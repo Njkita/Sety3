@@ -1,5 +1,11 @@
 version: "3.9"
 
+volumes:
+  mesh_certs:
+  mesh_configs:
+  pg_shard1_data:
+  pg_shard2_data:
+
 services:
   pg_shard1:
     image: postgres:15
@@ -9,6 +15,14 @@ services:
       POSTGRES_DB: notesdb
     ports:
       - "5433:5432"
+    volumes:
+      - pg_shard1_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notesdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
 
   pg_shard2:
     image: postgres:15
@@ -18,44 +32,160 @@ services:
       POSTGRES_DB: notesdb
     ports:
       - "5434:5432"
+    volumes:
+      - pg_shard2_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U notes -d notesdb"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+
+  meshctl:
+    build:
+      context: ./mesh/meshctl
+    volumes:
+      - mesh_certs:/mesh/certs
+      - mesh_configs:/mesh/configs
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /mesh/READY && test -f /mesh/certs/ca.crt && test -f /mesh/configs/service1.yaml && test -f /mesh/configs/mailer.yaml"]
+      interval: 1s
+      timeout: 1s
+      retries: 60
 
   service1:
     build:
       context: ./service
+    restart: unless-stopped
     environment:
       PG_DSN_1: postgres://notes:notes@pg_shard1:5432/notesdb
       PG_DSN_2: postgres://notes:notes@pg_shard2:5432/notesdb
     depends_on:
-      - pg_shard1
-      - pg_shard2
+      pg_shard1:
+        condition: service_healthy
+      pg_shard2:
+        condition: service_healthy
+
     expose:
       - "8000"
       - "50051"
-
+      - "9443"
+      - "9444"
     command: >
       sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
   service2:
     build:
       context: ./service
+    restart: unless-stopped
     environment:
       PG_DSN_1: postgres://notes:notes@pg_shard1:5432/notesdb
       PG_DSN_2: postgres://notes:notes@pg_shard2:5432/notesdb
     depends_on:
-      - pg_shard1
-      - pg_shard2
+      pg_shard1:
+        condition: service_healthy
+      pg_shard2:
+        condition: service_healthy
+
     expose:
       - "8000"
       - "50051"
+      - "9443"
+      - "9444"
     command: >
       sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000"
 
+  service1_envoy:
+    image: envoyproxy/envoy:v1.30.3
+    depends_on:
+      - meshctl
+      - service1
+    network_mode: "service:service1"
+    volumes:
+      - mesh_certs:/etc/mesh/certs:ro
+      - mesh_configs:/etc/envoy:ro
+    command: ["envoy", "-c", "/etc/envoy/service1.yaml", "--log-level", "info"]
+    restart: unless-stopped
+
+  service2_envoy:
+    image: envoyproxy/envoy:v1.30.3
+    depends_on:
+      - meshctl
+      - service2
+    network_mode: "service:service2"
+    volumes:
+      - mesh_certs:/etc/mesh/certs:ro
+      - mesh_configs:/etc/envoy:ro
+    command: ["envoy", "-c", "/etc/envoy/service2.yaml", "--log-level", "info"]
+    restart: unless-stopped
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "8025:8025"
+    expose:
+      - "1025"
+
+  mailer:
+    build:
+      context: ./mailer
+    environment:
+      NOTES_BACKENDS: "https://service1:9443,https://service2:9443"
+      MESH_CA: /mesh/certs/ca.crt
+      MESH_CERT: /mesh/certs/mailer.crt
+      MESH_KEY: /mesh/certs/mailer.key
+      SMTP_HOST: mailhog
+      SMTP_PORT: "1025"
+      SMTP_FROM: notes@local
+      DEFAULT_TO: test@local
+    depends_on:
+      meshctl:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+      service1:
+        condition: service_started
+      service2:
+        condition: service_started
+    volumes:
+      - mesh_certs:/mesh/certs:ro
+    expose:
+      - "8000"
+      - "9443"
+    command: >
+      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+  mailer_envoy:
+    image: envoyproxy/envoy:v1.30.3
+    depends_on:
+      - meshctl
+      - mailer
+    network_mode: "service:mailer"
+    volumes:
+      - mesh_certs:/etc/mesh/certs:ro
+      - mesh_configs:/etc/envoy:ro
+    command: ["envoy", "-c", "/etc/envoy/mailer.yaml", "--log-level", "info"]
+    restart: unless-stopped
+
   lb:
+    environment:
+      MESH_CERT_DIR: /mesh/certs
+      MESH_CA: /mesh/certs/ca.crt
+      MESH_CERT: /mesh/certs/lb.crt
+      MESH_KEY: /mesh/certs/lb.key
     build:
       context: ./lb
     depends_on:
-      - service1
-      - service2
+      meshctl:
+        condition: service_healthy
+      service1:
+        condition: service_started
+      service2:
+        condition: service_started
+      mailer:
+        condition: service_started
+    volumes:
+      - mesh_certs:/mesh/certs:ro
     expose:
       - "8443"
       - "8444"

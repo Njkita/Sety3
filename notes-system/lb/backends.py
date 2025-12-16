@@ -1,14 +1,17 @@
+import asyncio
+import ssl
+import os
 import time
-import random
-from typing import List
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
 import httpx
-from dataclasses import dataclass, field
 
 
 @dataclass
 class Backend:
     name: str
-    url: str  # http://service:8000
+    url: str  # https://service:9443
     failures: int = 0
     last_failure: float = 0.0
     circuit_open_until: float = 0.0
@@ -35,11 +38,16 @@ class Backend:
 
 
 class BackendPool:
-    def __init__(self, backends: List[Backend]):
+    def __init__(self, backends, verify_ca, client_cert):
         self.backends = backends
         self._rr_index = 0
+        self.verify_ca = verify_ca
+        self.client_cert = client_cert
 
-    def pick_backend(self) -> Backend | None:
+        self.ssl_ctx = ssl.create_default_context(cafile=self.verify_ca)
+        self.ssl_ctx.load_cert_chain(self.client_cert[0], self.client_cert[1])
+
+    def pick_backend(self) -> Optional[Backend]:
         alive = [b for b in self.backends if b.is_available()]
         if not alive:
             return None
@@ -48,7 +56,11 @@ class BackendPool:
         return b
 
     async def health_check_loop(self):
-        async with httpx.AsyncClient(timeout=1.0) as client:
+        async with httpx.AsyncClient(
+            timeout=2.0,
+            verify=self.ssl_ctx,
+            trust_env=False,
+        ) as client:
             while True:
                 for b in self.backends:
                     try:
@@ -57,9 +69,8 @@ class BackendPool:
                             b.record_success()
                         else:
                             b.record_failure()
-                    except Exception:
+                    except Exception as e:
+                        print(f"[HC] {b.name} {b.url} ERR {type(e).__name__}: {e!r}", flush=True)
                         b.record_failure()
                 await asyncio.sleep(2.0)
 
-
-import asyncio

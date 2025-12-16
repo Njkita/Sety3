@@ -1,34 +1,73 @@
 import asyncio
-import ssl
 import os
+import ssl
 
-from fastapi import FastAPI, Request, Response
 import httpx
 import uvicorn
+from fastapi import FastAPI, Request, Response
 
 from backends import Backend, BackendPool
 
 app = FastAPI()
 
-# HTTP-бэкенды (REST+SOAP)
-http_backends = BackendPool([
-    Backend(name="svc1", url="http://service1:8000"),
-    Backend(name="svc2", url="http://service2:8000"),
-])
+MESH_CERT_DIR = os.getenv("MESH_CERT_DIR", "/mesh/certs")
+MESH_CA = os.path.join(MESH_CERT_DIR, "ca.crt")
+MESH_CERT = os.path.join(MESH_CERT_DIR, "lb.crt")
+MESH_KEY = os.path.join(MESH_CERT_DIR, "lb.key")
+MESH_CLIENT_CERT = (MESH_CERT, MESH_KEY)
+
+
+notes_http_backends = BackendPool(
+    [
+        Backend(name="svc1", url="https://service1:9443"),
+        Backend(name="svc2", url="https://service2:9443"),
+    ],
+    verify_ca=MESH_CA,
+    client_cert=MESH_CLIENT_CERT,
+)
+
+mailer_http_backends = BackendPool(
+    [
+        Backend(name="mailer", url="https://mailer:9443"),
+    ],
+    verify_ca=MESH_CA,
+    client_cert=MESH_CLIENT_CERT,
+)
+
 
 @app.on_event("startup")
 async def on_startup():
-    asyncio.create_task(http_backends.health_check_loop())
+    asyncio.create_task(notes_http_backends.health_check_loop())
+    asyncio.create_task(mailer_http_backends.health_check_loop())
     asyncio.create_task(start_grpc_lb())
+
+
+def _pick_pool_by_path(full_path: str) -> BackendPool:
+    if full_path == "mail" or full_path.startswith("mail/"):
+        return mailer_http_backends
+    return notes_http_backends
+
+@app.get("/__debug/backends")
+def debug_backends():
+    def snap(pool: BackendPool):
+        return [
+            {
+                "name": b.name,
+                "url": b.url,
+                "alive": b.alive,
+                "failures": b.failures,
+                "circuit_open_until": b.circuit_open_until,
+            }
+            for b in pool.backends
+        ]
+    return {"notes": snap(notes_http_backends), "mailer": snap(mailer_http_backends)}
 
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_all(full_path: str, request: Request):
-    """
-    Прокси для REST+SOAP: всё, что пришло, пробрасываем на выбранный backend.
-    Таймаут 2 сек.
-    """
-    backend = http_backends.pick_backend()
+    pool = _pick_pool_by_path(full_path)
+
+    backend = pool.pick_backend()
     if not backend:
         return Response(status_code=503, content="No backend available")
 
@@ -38,34 +77,47 @@ async def proxy_all(full_path: str, request: Request):
     body = await request.body()
 
     try:
-        async with httpx.AsyncClient(timeout=2.0) as client:
+        async with httpx.AsyncClient(
+            timeout=2.0,
+            verify=pool.ssl_ctx,
+            trust_env=False,
+        ) as client:
             r = await client.request(method, url, headers=headers, content=body)
-    except Exception:
+
+    except Exception as e:
         backend.record_failure()
         return Response(status_code=502, content="Backend error")
+
+
 
     backend.record_success()
     return Response(
         status_code=r.status_code,
         content=r.content,
-        headers={k: v for k, v in r.headers.items()
-                 if k.lower() not in ["content-length", "transfer-encoding", "connection"]},
+        headers={
+            k: v
+            for k, v in r.headers.items()
+            if k.lower() not in ["content-length", "transfer-encoding", "connection"]
+        },
     )
 
-# === gRPC TCP LB (L4) ===
 
-GRPC_BACKENDS = [("service1", 50051), ("service2", 50051)]
+GRPC_BACKENDS = [("service1", 9444), ("service2", 9444)]
+
 
 async def handle_grpc_client(reader, writer):
-    """
-    Простой TCP proxy: выбираем backend, открываем соединение, прокидываем байты в обе стороны.
-    """
     backend = GRPC_BACKENDS[handle_grpc_client.counter % len(GRPC_BACKENDS)]
     handle_grpc_client.counter += 1
     host, port = backend
 
+    client_ctx = ssl.create_default_context(cafile=MESH_CA)
+    client_ctx.load_cert_chain(MESH_CERT, MESH_KEY)
+    client_ctx.set_alpn_protocols(["h2"])
+
     try:
-        backend_reader, backend_writer = await asyncio.open_connection(host, port)
+        backend_reader, backend_writer = await asyncio.open_connection(
+            host, port, ssl=client_ctx, server_hostname=host
+        )
     except Exception:
         writer.close()
         await writer.wait_closed()
@@ -92,13 +144,11 @@ async def handle_grpc_client(reader, writer):
         pipe(backend_reader, writer),
     )
 
+
 handle_grpc_client.counter = 0
 
+
 async def start_grpc_lb():
-    """
-    gRPC LB с TLS (наш балансировщик поддерживает https и для gRPC).
-    Клиенты gRPC подключаются к этому порту.
-    """
     certfile = os.path.join("certs", "lb.crt")
     keyfile = os.path.join("certs", "lb.key")
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -117,9 +167,6 @@ async def start_grpc_lb():
 
 
 if __name__ == "__main__":
-    ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ssl_ctx.load_cert_chain("certs/lb.crt", "certs/lb.key")
-
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
